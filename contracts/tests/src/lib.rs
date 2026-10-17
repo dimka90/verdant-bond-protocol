@@ -2022,8 +2022,8 @@ mod integration {
                 path.exists(),
                 "missing bond_positions.json fixture; regenerate with: cargo test -p nbbs-tests --features storage-fixture-update regenerate_bond_position_fixture_file"
             );
-            let raw = std::fs::read_to_string(&path)
-                .expect("failed to read bond_positions.json fixture");
+            let raw =
+                std::fs::read_to_string(&path).expect("failed to read bond_positions.json fixture");
             let on_disk: Vec<BondPositionFixture> = serde_json::from_str(&raw)
                 .expect("bond_positions.json is not valid JSON (regenerate fixtures)");
             assert_eq!(

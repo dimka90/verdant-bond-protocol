@@ -183,5 +183,8 @@ pub fn find_bond_position_fixture(
     fixtures: &[BondPositionFixture],
     scenario: &str,
 ) -> Option<BondPositionFixture> {
-    fixtures.iter().find(|fixture| fixture.scenario == scenario).cloned()
+    fixtures
+        .iter()
+        .find(|fixture| fixture.scenario == scenario)
+        .cloned()
 }
