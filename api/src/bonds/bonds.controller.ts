@@ -1,7 +1,9 @@
 import {
-  Controller, Get, Post, Body, Param, Query, Req, HttpCode, HttpStatus, UseGuards, ParseIntPipe, Header
+  Controller, Get, Post, Body, Param, Query, Req, Res, HttpCode, HttpStatus, UseGuards, ParseIntPipe, Header
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { BondsService } from './bonds.service';
+import { RegulatorExportService } from './regulator-export.service';
 import { CreateBondDto } from './dto/create-bond.dto';
 import { SubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
@@ -31,7 +33,10 @@ import {
 
 @Controller('bonds')
 export class BondsController {
-  constructor(private readonly bondsService: BondsService) {}
+  constructor(
+    private readonly bondsService: BondsService,
+    private readonly regulatorExportService: RegulatorExportService,
+  ) {}
 
   @Post()
   @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
@@ -185,9 +190,18 @@ export class BondsController {
   @UseGuards(JwtAuthGuard)
   async exportBond(
     @Param('id', ParseIntPipe) id: number,
+    @Query('format') format: string,
+    @Query('section') section: string,
     @Req() req: any,
-  ): Promise<any> {
+    @Res() res: Response,
+  ): Promise<void> {
     const auditorAddress = req.user?.walletAddress || '';
-    return this.bondsService.exportBond(id, auditorAddress);
+    const rendered = await this.regulatorExportService.export(id, auditorAddress, {
+      format,
+      section,
+    });
+    res.setHeader('Content-Type', rendered.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${rendered.filename}"`);
+    res.send(rendered.body);
   }
 }

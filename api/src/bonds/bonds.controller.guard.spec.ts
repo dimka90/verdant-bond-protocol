@@ -2,6 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
 import { BondsController } from './bonds.controller';
 import { BondsService } from './bonds.service';
+import { RegulatorExportService } from './regulator-export.service';
 import { buildControllerApp } from '../test/controller-guard.harness';
 import { autoMock, TestRole } from '../test/guard-role-mocks';
 
@@ -14,6 +15,10 @@ describe('BondsController authorization (behavioral)', () => {
   beforeAll(async () => {
     app = await buildControllerApp(BondsController, [
       { provide: BondsService, useValue: mockBondsService },
+      {
+        provide: RegulatorExportService,
+        useValue: new RegulatorExportService(mockBondsService),
+      },
     ]);
     bondsService = app.get(BondsService) as jest.Mocked<BondsService>;
   });
