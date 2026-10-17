@@ -17,6 +17,7 @@ import {
   ChallengeStateResponse,
   ChallengedReportSummary,
   CouponEligibility,
+  SlashPreview,
 } from './interfaces/oracle.interface';
 import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
@@ -24,7 +25,7 @@ import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk
 import { StellarService } from '../stellar/stellar.service';
 import { toBigIntString, encodeCid } from '../common/utils';
 import { ConfigService } from '../config/config.service';
-import { verifyManifest, verifyManifestMatchesReport } from '../../../oracle/manifest';
+import { verifyManifest, verifyManifestMatchesReport } from './manifest-verification';
 
 
 
@@ -39,6 +40,7 @@ export class OracleService {
     'VERRA-VCS',
     'BLUE-CARBON',
     'REMOTE-SENSING',
+    'IOT-SENSORS',
   ];
 
   constructor(
@@ -97,7 +99,6 @@ async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<Repor
     }
 
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getOracleConsumerAddress(), providerAddress);
 
     const { result } = await this.contractService.invokeContractMethod(
       this.configService.getOracleConsumerAddress(), 'submit_report', adminSecret,
@@ -110,7 +111,7 @@ async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<Repor
         nativeToScVal(dto.methodology, { type: 'symbol' }),
         this.evidenceHashToScVal(evidenceReference),
       ],
-      nonce,
+      providerAddress,
     );
 
     const reportId = Number(scValToNative(result));
@@ -256,7 +257,6 @@ async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<Repor
 
 async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getOracleConsumerAddress(), challengerAddress);
 
     await this.contractService.invokeContractMethod(
       this.configService.getOracleConsumerAddress(), 'challenge_report', adminSecret,
@@ -265,7 +265,7 @@ async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: st
         nativeToScVal(BigInt(reportId), { type: 'u64' }),
         this.toBytes32(dto.counterEvidenceHash),
       ],
-      nonce,
+      challengerAddress,
     );
 
     await this.redis.del(`oracle:providers`);
@@ -308,7 +308,6 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
 
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(this.configService.getOracleConsumerAddress(), adminAddress);
 
     await this.contractService.invokeContractMethod(
       this.configService.getOracleConsumerAddress(), 'register_provider', adminSecret,
@@ -317,7 +316,7 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
         Address.fromString(dto.providerAddress).toScVal(),
         nativeToScVal(methodology, { type: 'symbol' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     await this.redis.del(`oracle:providers`);
@@ -438,6 +437,23 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
     return this.toArray(scValToNative(scVal)).map((record) =>
       this.decodeSlashRecord(this.toRecord(record)),
     );
+  }
+
+  async getSlashPreview(providerAddress: string, reportId: number): Promise<SlashPreview> {
+    const scVal = await this.contractService.simulateCall({
+      contractAddress: this.configService.getOracleConsumerAddress(),
+      method: 'preview_slash',
+      args: [Address.fromString(providerAddress).toScVal(), nativeToScVal(BigInt(reportId), { type: 'u64' })],
+    });
+    const data = scValToNative(scVal) as any[];
+    return {
+      reportId: Number(data[0]),
+      providerAddress: data[1] as string,
+      currentStake: toBigIntString(data[2]),
+      penalty: toBigIntString(data[3]),
+      remainingStake: toBigIntString(data[4]),
+      activeAfter: data[5] as boolean,
+    };
   }
 
   async getChallengeHistory(providerAddress: string): Promise<ChallengeRecord[]> {
@@ -581,6 +597,31 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async getProjectStalenessState(projectId: string): Promise<{
+    projectId: string;
+    lastReportTimestamp: number;
+    currentTier: number;
+    timeElapsed: number;
+    discountBps: number;
+  }> {
+    const scVal = await this.contractService.simulateCall({
+      contractAddress: this.configService.getOracleConsumerAddress(),
+      method: 'get_project_staleness_state',
+      args: [
+        this.toBytes32(projectId),
+        nativeToScVal(BigInt(Math.floor(Date.now() / 1000)), { type: 'u64' }),
+      ],
+    });
+    const data = scValToNative(scVal) as any;
+    return {
+      projectId: this.field(data, 'project_id', 0) ?? projectId,
+      lastReportTimestamp: Number(this.field(data, 'last_report_timestamp', 1) ?? 0),
+      currentTier: Number(this.field(data, 'current_tier', 2) ?? 0),
+      timeElapsed: Number(this.field(data, 'time_elapsed', 3) ?? 0),
+      discountBps: Number(this.field(data, 'discount_bps', 4) ?? 0),
+    };
   }
 
   private getAdminSecret(): string {

@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { Permission } from '../auth/rbac';
 import { INestApplication, BadRequestException } from '@nestjs/common';
 import * as request from 'supertest';
 import * as crypto from 'crypto';
@@ -7,6 +8,9 @@ import { BondsService } from '../bonds/bonds.service';
 import { ProjectsController } from './projects.controller';
 import { BondsController } from '../bonds/bonds.controller';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { IntentGuard } from '../common/guards/intent.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
+import { KycGuard } from '../common/guards/kyc.guard';
 
 describe('Data Export Endpoints', () => {
   let app: INestApplication;
@@ -24,7 +28,11 @@ describe('Data Export Endpoints', () => {
   const mockJwtAuthGuard = {
     canActivate: (context: any) => {
       const req = context.switchToHttp().getRequest();
-      req.user = { walletAddress: 'G_AUDITOR_ADDRESS_123' };
+      // The bond export requires EXPORT_BOND (#228); an auditor's token carries it.
+      req.user = {
+        walletAddress: 'G_AUDITOR_ADDRESS_123',
+        permissions: [Permission.EXPORT_BOND],
+      };
       return true;
     },
   };
@@ -39,6 +47,12 @@ describe('Data Export Endpoints', () => {
     })
       .overrideGuard(JwtAuthGuard)
       .useValue(mockJwtAuthGuard)
+      .overrideGuard(AdminGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(KycGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(IntentGuard)
+      .useValue({ canActivate: () => true })
       .compile();
 
     app = moduleRef.createNestApplication();

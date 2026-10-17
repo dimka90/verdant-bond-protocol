@@ -15,9 +15,8 @@ interface KycStoreSnapshot {
   version: number;
 }
 
-const DEFAULT_DIR =
-  process.env.KYC_STORE_DIR || path.join(process.cwd(), 'data', 'kyc');
-const RECORDS_FILE = 'kyc-records.json';
+/** Live KYC state; the retention job must never expire it (#411). */
+export const RECORDS_FILE = 'kyc-records.json';
 const AUDIT_FILE = 'kyc-audit.log.jsonl';
 
 const SNAPSHOT_EMPTY: KycStoreSnapshot = {
@@ -37,7 +36,7 @@ export class KycStoreService implements OnModuleInit {
   private writeLock: Promise<void> = Promise.resolve();
 
   constructor() {
-    this.dir = DEFAULT_DIR;
+    this.dir = process.env.KYC_STORE_DIR || path.join(process.cwd(), 'data', 'kyc');
     this.recordsPath = path.join(this.dir, RECORDS_FILE);
     this.auditPath = path.join(this.dir, AUDIT_FILE);
     this.fileFs = fs.promises;
@@ -93,7 +92,7 @@ export class KycStoreService implements OnModuleInit {
     const entry: KycAuditEntry = {
       id: crypto.randomBytes(16).toString('hex'),
       address: input.address,
-      fromStatus: existing?.status ?? null,
+      fromStatus: existing?.status ?? KycStatus.PENDING,
       toStatus: input.toStatus,
       source: input.source,
       actor: input.actor ?? null,
@@ -281,7 +280,8 @@ export class KycStoreService implements OnModuleInit {
 
   private isEnoent(error: unknown): boolean {
     return (
-      error instanceof Error &&
+      typeof error === 'object' &&
+      error !== null &&
       (error as NodeJS.ErrnoException).code === 'ENOENT'
     );
   }

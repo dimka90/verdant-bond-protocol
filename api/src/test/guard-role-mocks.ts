@@ -1,14 +1,20 @@
 import { CanActivate, ExecutionContext, UnauthorizedException, ForbiddenException } from '@nestjs/common';
+import { Role, RolePermissions } from '../auth/rbac';
 
 /**
  * Role taxonomy used by the controller authorization specs. Each fake guard below
  * reads `x-test-role` from the request header and enforces the SAME allow/deny
  * semantics as the real guard it stands in for:
  *
- *   - JwtAuthGuard  : allows everyone except `anon`; populates `req.user`.
+ *   - JwtAuthGuard  : allows everyone except `anon`; populates `req.user`,
+ *                     including the RBAC `permissions` a real token carries
+ *                     (`admin` is the maintainer, everyone else an investor).
+ *                     The real `PermissionsGuard` then runs unmodified.
  *   - AdminGuard     : allows only `admin` (throws UnauthorizedException, like the real one).
  *   - KycGuard       : allows only `verified` (throws ForbiddenException for everyone else).
  *   - ProviderGuard  : allows only `provider` (throws UnauthorizedException).
+ *   - IntentGuard    : allow-all (intent verification is covered separately by
+ *                      `intent.service.spec.ts`, not the behavioural role specs).
  *
  * The real guards remain covered by `route-authorization.matrix.spec.ts` (which
  * asserts they are actually wired) and `guard-roles.spec.ts` (unit behaviour).
@@ -28,9 +34,12 @@ export const fakeJwtAuthGuard: CanActivate = {
       throw new UnauthorizedException('Authentication required');
     }
     const req = ctx.switchToHttp().getRequest();
+    const rbacRole = role === 'admin' ? Role.MAINTAINER : Role.INVESTOR;
     req.user = {
       walletAddress: `G_${role.toUpperCase()}_ADDRESS`,
       kycStatus: role === 'verified' ? 'verified' : 'none',
+      roles: [rbacRole],
+      permissions: [...RolePermissions[rbacRole]],
     };
     return true;
   },

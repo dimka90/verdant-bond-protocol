@@ -11,7 +11,11 @@ import { ChallengeDto } from './dto/challenge.dto';
 import { RegisterProviderDto } from './dto/register-provider.dto';
 import { ListOracleIncidentsDto } from './dto/list-oracle-incidents.dto';
 import { ResolveOracleIncidentDto } from './dto/resolve-oracle-incident.dto';
-import { AdminGuard } from '../common/guards/admin.guard';
+import { PermissionsGuard } from '../common/guards/permissions.guard';
+import { RequirePermissions } from '../common/decorators/permissions.decorator';
+import { Permission } from '../auth/rbac';
+import { RequireQuota } from '../common/decorators/quota.decorator';
+import { QuotaResource } from '../common/services/quota.service';
 import { IntentGuard } from '../common/guards/intent.guard';
 import { RequireIntent } from '../common/decorators/require-intent.decorator';
 import { RateLimit } from '../common/decorators/rate-limit.decorator';
@@ -30,22 +34,25 @@ import { OracleIncident } from './interfaces/oracle-incident.interface';
 import { OracleIncidentRepository } from './oracle-incident.repository';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
 
+import { CircuitBreakerService, CircuitBreakerState } from './circuit-breaker.service';
+
 @Controller('oracle')
 export class OracleController {
   constructor(
     private readonly oracleService: OracleService,
     private readonly monitoringService: OracleMonitoringService,
     private readonly incidents: OracleIncidentRepository,
+    private readonly circuitBreaker: CircuitBreakerService,
   ) {}
 
   @Post('reports')
-  @UseGuards(JwtAuthGuard, ProviderGuard)
+  @RequireQuota(QuotaResource.SUBMIT_ORACLE_REPORT)
   @HttpCode(HttpStatus.CREATED)
   async submitReport(
     @Body() dto: SubmitReportDto,
     @Req() req: any,
   ): Promise<ReportResponse> {
-    const providerAddress = req.user.walletAddress;
+    const providerAddress = req.headers['x-provider-address'] as string;
     return this.oracleService.submitReport(dto, providerAddress);
   }
 
@@ -92,19 +99,19 @@ export class OracleController {
   }
 
   @Post('challenge/:reportId')
-  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async challengeReport(
     @Param('reportId', ParseIntPipe) reportId: number,
     @Body() dto: ChallengeDto,
     @Req() req: any,
   ): Promise<ChallengeResponse> {
-    const challengerAddress = req.user.walletAddress;
+    const challengerAddress = req.headers['x-wallet-address'] as string;
     return this.oracleService.challengeReport(reportId, dto, challengerAddress);
   }
 
   @Post('providers')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.REGISTER_PROVIDER)
   @RequireIntent('register_provider', 'id', 'global')
   @RateLimit({ type: 'oracle' })
   @HttpCode(HttpStatus.CREATED)
@@ -129,6 +136,11 @@ export class OracleController {
     return this.monitoringService.computeStaleness();
   }
 
+  @Get('staleness/:projectId')
+  async getProjectStalenessState(@Param('projectId') projectId: string) {
+    return this.oracleService.getProjectStalenessState(projectId);
+  }
+
   @Get('monitoring/anomalies')
   @Header('Cache-Control', 'no-cache')
   async anomalies(): Promise<OracleAnomalyReport> {
@@ -142,15 +154,17 @@ export class OracleController {
    * acknowledgement/resolution is operational state, not public data.
    */
   @Get('incidents')
-  @UseGuards(JwtAuthGuard, AdminGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
   async listIncidents(
     @Query() query: ListOracleIncidentsDto,
   ): Promise<PaginatedResponse<OracleIncident>> {
-    return this.incidents.findMany(query.page, query.limit, query.status);
+    return this.incidents.findMany(query.page, query.limit, query.status, query.cursor);
   }
 
   @Post('incidents/:id/acknowledge')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
   @RequireIntent('acknowledge_incident', 'id')
   @HttpCode(HttpStatus.OK)
   async acknowledgeIncident(
@@ -162,7 +176,8 @@ export class OracleController {
   }
 
   @Post('incidents/:id/resolve')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
   @RequireIntent('resolve_incident', 'id')
   @HttpCode(HttpStatus.OK)
   async resolveIncident(
@@ -173,4 +188,45 @@ export class OracleController {
     const resolvedBy = req.headers['x-wallet-address'] as string || '';
     return this.incidents.resolve(id, resolvedBy, dto.resolutionNote);
   }
+
+  /**
+   * Check circuit breaker pause status for a project or tranche (#332).
+   */
+  @Get('circuit-breaker/:projectId')
+  async getCircuitBreakerStatus(
+    @Param('projectId') projectId: string,
+    @Query('tranche') tranche?: string,
+  ): Promise<{ isPaused: boolean; state: CircuitBreakerState | null }> {
+    const isPaused = this.circuitBreaker.isProjectPaused(projectId, tranche);
+    const state = this.circuitBreaker.getCircuitBreakerState(projectId, tranche);
+    return { isPaused, state };
+  }
+
+  /**
+   * Governance/multisig action to unpause and resume project distribution & trading (#332).
+   * Circuit breaker NEVER unpauses automatically via timeout.
+   */
+  @Post('circuit-breaker/resume')
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
+  @HttpCode(HttpStatus.OK)
+  async resumeProject(
+    @Body() body: {
+      projectId: string;
+      tranche?: string;
+      multisigSignatures: string[];
+      resumptionReason: string;
+    },
+    @Req() req: any,
+  ): Promise<CircuitBreakerState> {
+    const governanceActor = req.user?.walletAddress || 'GOVERNANCE_MULTISIG';
+    return this.circuitBreaker.resumeProject({
+      projectId: body.projectId,
+      tranche: body.tranche,
+      governanceActor,
+      multisigSignatures: body.multisigSignatures,
+      resumptionReason: body.resumptionReason,
+    });
+  }
 }
+

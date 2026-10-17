@@ -11,7 +11,7 @@ import {
   UndistributedTotalResponse, SweepUndistributedResponse,
   QuoteBalanceResponse, QuoteTransactionResponse,
   QuoteAsset, DepositQuoteDto, WithdrawQuoteDto, HolderResponse,
-  ClaimableCreditDetail, ClaimableCreditsResponse,
+  ClaimableCreditsResponse, CouponDistributionResponse, HolderListResponse, TransactionStatusResponse,
 } from '../interfaces/bond.interface';
 
 export interface ProblemDetails {
@@ -230,6 +230,71 @@ export class ApiService {
     }));
   }
 
+  distributeCoupon(id: number, dto: { periodIndex: number }): Observable<CouponDistributionResponse> {
+    return this.withProblemDetails(defer(() => {
+      const headers = this.headers(this.adminIntentHeader('distribute_coupon', String(id)));
+      return this.http.post<CouponDistributionResponse>(
+        `/api/bonds/${id}/coupon`,
+        dto,
+        { headers },
+      );
+    }));
+  }
+
+  mature(id: number): Observable<Bond> {
+    return this.withProblemDetails(defer(() => {
+      const headers = this.headers(this.adminIntentHeader('mature_bond', String(id)));
+      return this.http.post<Bond>(
+        `/api/bonds/${id}/mature`,
+        {},
+        { headers },
+      );
+    }));
+  }
+
+  reconcileHolders(id: number): Observable<HolderListResponse> {
+    return this.withProblemDetails(defer(() => {
+      const headers = this.headers(this.adminIntentHeader('reconcile_holders', String(id)));
+      return this.http.post<HolderListResponse>(
+        `/api/bonds/${id}/reconcile-holders`,
+        {},
+        { headers },
+      );
+    }));
+  }
+
+  previewSubscribe(id: number, amount: number): Observable<{remaining_supply: number; requested_amount: number; expected_failure: string | null}> {
+    return this.withProblemDetails(this.http.get<{
+      remaining_supply: number;
+      requested_amount: number;
+      expected_failure: string | null;
+    }>(`/api/bonds/${id}/preview-subscribe?amount=${amount}`, {
+      headers: this.headers(),
+    }));
+  }
+
+  approveProject(id: number): Observable<Project> {
+    return this.withProblemDetails(defer(() => {
+      const headers = this.headers(this.adminIntentHeader('approve_project', String(id)));
+      return this.http.post<Project>(
+        `/api/projects/${id}/approve`,
+        {},
+        { headers },
+      );
+    }));
+  }
+
+  rejectProject(id: number): Observable<Project> {
+    return this.withProblemDetails(defer(() => {
+      const headers = this.headers(this.adminIntentHeader('reject_project', String(id)));
+      return this.http.post<Project>(
+        `/api/projects/${id}/reject`,
+        {},
+        { headers },
+      );
+    }));
+  }
+
   getProjects(page = 1, limit = 20): Observable<PaginatedResponse<Project>> {
     return this.withProblemDetails(this.http.get<PaginatedResponse<Project>>('/api/projects', {
       params: { page, limit },
@@ -281,6 +346,12 @@ export class ApiService {
     return this.http.delete<void>(`/api/marketplace/orders/${orderId}`, { headers: this.headers() });
   }
 
+  getTransactionStatus(hash: string): Observable<TransactionStatusResponse> {
+    return this.withProblemDetails(this.http.get<TransactionStatusResponse>(`/api/stellar/transactions/${hash}`, {
+      headers: this.headers(),
+    }));
+  }
+
   getQuoteBalance(asset: QuoteAsset = 'USDC'): Observable<QuoteBalanceResponse> {
     return this.withProblemDetails(this.http.get<QuoteBalanceResponse>('/api/marketplace/quote-balance', {
       params: { asset },
@@ -305,11 +376,11 @@ export class ApiService {
     return this.withProblemDetails(this.http.post<QuoteTransactionResponse>('/api/marketplace/withdraw', data, { headers }));
   }
 
-  getPortfolio(address?: string, force = false): Observable<any> {
+  getPortfolio(address?: string, force = false): Observable<Record<string, unknown>> {
     let params = new HttpParams();
     if (address) params = params.set('address', address);
     if (force) params = params.set('force', 'true');
-    return this.withProblemDetails(this.http.get<any>('/api/portfolio', {
+    return this.withProblemDetails(this.http.get<Record<string, unknown>>('/api/portfolio', {
       params,
       headers: this.headers(),
     }));
@@ -346,5 +417,9 @@ export class ApiService {
     return this.withProblemDetails(
       this.http.get<BondDetailResponse>(`/api/bonds/${id}/detail`, { params }),
     );
+  }
+
+  getTransactionStatus(hash: string): Observable<TransactionStatusResponse> {
+    return this.withProblemDetails(this.http.get<TransactionStatusResponse>(`/api/stellar/transactions/${hash}`));
   }
 }

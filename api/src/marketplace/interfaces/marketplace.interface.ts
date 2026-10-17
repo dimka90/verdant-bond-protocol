@@ -25,6 +25,7 @@ export interface OrderResponse {
   status: OrderStatus;
   createdAt: string;
   expiresAt: string;
+  transactionHash?: string;
 }
 
 export interface QuoteBalanceResponse {
@@ -42,6 +43,7 @@ export interface QuoteTransactionResponse {
 
 export interface PriceFeedResponse {
   bondId: number;
+  quoteAsset: QuoteAsset;
   bestPrice: string;
   averagePrice: string;
   totalOrders: number;
@@ -56,6 +58,34 @@ export interface PriceLevel {
 
 export type FillabilityStatus = 'fully_fillable' | 'partially_fillable' | 'unfillable';
 
+export type LiquidityTier = 'LIQUID' | 'MODERATE' | 'ILLIQUID';
+
+export interface PriceImpactConfig {
+  illiquidThresholdAmount: string;
+  moderateThresholdAmount: string;
+  tierImpactLimitsBps: Record<LiquidityTier, number>;
+  maxIlliquidDepthConsumptionBps: number;
+}
+
+export interface PriceImpactEvaluation {
+  bondId: number;
+  requestedAmount: string;
+  quoteAsset: QuoteAsset;
+  liquidityTier: LiquidityTier;
+  availableDepth: string;
+  bestPrice: string;
+  marginalPrice: string;
+  averageExecutionPrice: string;
+  totalCost: string;
+  priceImpactBps: number;
+  maxAllowedImpactBps: number;
+  isAllowed: boolean;
+  depthConsumptionRatioBps: number;
+  maxDepthConsumptionBps: number;
+  reason?: string;
+  suggestedMaxAmount?: string;
+}
+
 export interface SlippageResponse {
   bondId: number;
   requestedAmount: string;
@@ -66,3 +96,4 @@ export interface SlippageResponse {
   slippagePercent: number;
   fillabilityStatus: FillabilityStatus;
 }
+

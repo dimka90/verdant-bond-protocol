@@ -1,5 +1,6 @@
 import { Component, inject, OnInit, ChangeDetectionStrategy, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { SafeUrlPipe } from '../../shared/pipes/safe-url.pipe';
 import { RouterModule, ActivatedRoute } from '@angular/router';
 import { ApiService } from '../../shared/services/api.service';
 import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
@@ -7,11 +8,13 @@ import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner
 import { ChallengedReportsComponent } from '../challenged-reports/challenged-reports.component';
 import { Project, ProjectProvenanceEvent } from '../../shared/interfaces/bond.interface';
 import { forkJoin } from 'rxjs';
+import { AdminAccessService } from '../../shared/services/admin-access.service';
+import { appErrorMessage } from '../../shared/errors/api-error';
 
 @Component({
   selector: 'app-project-detail',
   standalone: true,
-  imports: [CommonModule, RouterModule, StatusBadgeComponent, LoadingSpinnerComponent, ChallengedReportsComponent],
+  imports: [CommonModule, RouterModule, StatusBadgeComponent, LoadingSpinnerComponent, ChallengedReportsComponent, SafeUrlPipe],
   template: `
     <div class="detail-page">
       <a class="back-link" routerLink="/projects">← Back to Projects</a>
@@ -54,7 +57,7 @@ import { forkJoin } from 'rxjs';
             </div>
             <div class="detail-field">
               <span class="field-label">Metadata</span>
-              <a class="field-value link" [href]="metadataUrl()" target="_blank" rel="noopener noreferrer">View on IPFS →</a>
+              <a class="field-value link" [href]="metadataUrl() | safeUrl" target="_blank" rel="noopener noreferrer">View on IPFS →</a>
             </div>
           </div>
         </div>
@@ -70,13 +73,25 @@ import { forkJoin } from 'rxjs';
                   <span class="timeline-dot" [class.pending]="event.status !== 'complete'"></span>
                   <div><strong>{{ event.title }}</strong>
                     <div class="timeline-meta">{{ event.occurredAt ? (event.occurredAt | date:'medium') : event.status }}</div>
-                    @if (event.evidenceUrl) { <a [href]="event.evidenceUrl" target="_blank" rel="noopener noreferrer">View evidence →</a> }
+                    @if (event.evidenceUrl) { <a [href]="event.evidenceUrl | safeUrl" target="_blank" rel="noopener noreferrer">View evidence →</a> }
                   </div>
                 </li>
               }
             </ol>
           }
         </section>
+
+        @if (adminAccess.isAdmin()) {
+          <div class="admin-section" style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+            <h3 class="section-title">Admin: Project Approval</h3>
+            @if (project()?.status === 'Pending') {
+              <button class="btn btn-primary" (click)="onApprove()">Approve Project</button>
+              <button class="btn btn-outline" (click)="onReject()">Reject Project</button>
+            } @else {
+              <p class="status-notice">Project is already {{ project()?.status | lowercase }}.</p>
+            }
+          </div>
+        }
 
         <app-challenged-reports [projectId]="'' + p.id" />
       } @else if (loading()) {
@@ -115,6 +130,7 @@ import { forkJoin } from 'rxjs';
 export class ProjectDetailComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly apiService = inject(ApiService);
+  readonly adminAccess = inject(AdminAccessService);
 
   readonly project = signal<Project | null>(null);
   readonly loading = signal(true);
@@ -133,6 +149,10 @@ export class ProjectDetailComponent implements OnInit {
       this.loading.set(false);
       return;
     }
+    this.loadProject(id);
+  }
+
+  private loadProject(id: number): void {
     forkJoin({ project: this.apiService.getProject(id), provenance: this.apiService.getProjectProvenance(id) }).subscribe({
       next: ({ project, provenance }) => {
         this.project.set(project);
@@ -142,6 +162,30 @@ export class ProjectDetailComponent implements OnInit {
       error: (err) => {
         this.error.set(err.status === 404 ? 'Project not found' : 'Failed to load project');
         this.loading.set(false);
+      },
+    });
+  }
+
+  onApprove(): void {
+    if (!confirm(`Approve project #${this.project()?.id}?`)) return;
+    this.apiService.approveProject(this.project()!.id).subscribe({
+      next: () => {
+        this.loadProject(id);
+      },
+      error: (err) => {
+        this.error.set(appErrorMessage(err, 'Approve failed'));
+      },
+    });
+  }
+
+  onReject(): void {
+    if (!confirm(`Reject project #${this.project()?.id}?`)) return;
+    this.apiService.rejectProject(this.project()!.id).subscribe({
+      next: () => {
+        this.loadProject(id);
+      },
+      error: (err) => {
+        this.error.set(appErrorMessage(err, 'Reject failed'));
       },
     });
   }

@@ -114,6 +114,9 @@ fn build_fixture(
         credit_type: CreditType::Carbon,
         maturity_date: 3_000_000,
         total_supply: TOTAL_SUPPLY,
+        credit_vintage: 2024,
+        serial_number_start: 1,
+        serial_number_end: 1000,
     };
     let state = BondState {
         total_subscribed,

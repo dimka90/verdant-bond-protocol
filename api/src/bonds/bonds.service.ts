@@ -1,7 +1,11 @@
-import { Injectable, BadRequestException, Optional } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, Optional } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { ContractException } from '../stellar/contract-errors';
 import { StellarService } from '../stellar/stellar.service';
+import { ComplianceAttestationService } from '../compliance/services/compliance-attestation.service';
+import { ComplianceRulesEngine } from '../compliance/services/compliance-rules.engine';
+import { ComplianceSnapshotService } from '../compliance/services/compliance-snapshot.service';
+import { TrancheType } from '../compliance/interfaces/compliance.interface';
 import { NonceService } from '../common/services/nonce.service';
 import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
@@ -15,11 +19,13 @@ import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk
 import * as crypto from 'crypto';
 import {
   BondResponse,
+  BondDetailResponse,
   HeldBondResponse,
   SubscriptionResponse,
   HolderListResponse,
   CouponDistributionResponse,
   ClaimCreditsResponse,
+  ClaimableCreditsResponse,
   TransferResponse,
   UndistributedTotalResponse,
   SweepUndistributedResponse,
@@ -27,8 +33,6 @@ import {
   BondMaturityStatusEnum,
   CreditTypeEnum,
   ClaimableCreditDetail,
-  ClaimableCreditsResponse,
-  BondDetailResponse,
 } from './interfaces/bond.interface';
 import { toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
@@ -59,11 +63,16 @@ export class BondsService {
     private readonly configService: ConfigService,
     private readonly holderIndex: HolderIndexService,
     @Optional() private readonly oracleService?: OracleService,
+    @Optional() private readonly complianceAttestation?: ComplianceAttestationService,
+    @Optional() private readonly complianceRulesEngine?: ComplianceRulesEngine,
+    @Optional() private readonly complianceSnapshots?: ComplianceSnapshotService,
   ) {}
 
   async create(dto: CreateBondDto): Promise<BondResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+
+
     const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
 
     const configScVal = this.encodeBondConfig(dto);
@@ -71,12 +80,13 @@ export class BondsService {
     const { result, transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getBondIssuerAddress(), 'issue_bond', adminSecret,
       [Address.fromString(adminAddress).toScVal(), configScVal],
-      nonce,
+      adminAddress,
     );
 
     const bondId = Number(scValToNative(result));
     const bond = await this.buildBondResponse(bondId);
     await this.redis.setEx(`bond:${bondId}`, 300, JSON.stringify(bond));
+    return bond;
     return { ...bond, transactionHash };
   }
 
@@ -160,6 +170,8 @@ export class BondsService {
 
   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
     const investorSecret = this.signingKeys.investorSecret();
+    await this.verifySubscriptionEligibility(id, dto);
+
     const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.investorAddress);
     const { transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getBondIssuerAddress(), 'subscribe', investorSecret,
@@ -168,14 +180,85 @@ export class BondsService {
         nativeToScVal(BigInt(id), { type: 'u64' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
-      nonce,
+      dto.investorAddress,
     );
 
     await this.redis.del(`bond:${id}`);
     await this.holderIndex.recordSubscribe(id, dto.investorAddress);
     this.invalidatePortfolio(dto.investorAddress);
 
+    await this.complianceSnapshots?.capture(`bond:${id}:subscription:${transactionHash}`, 'BOND_SUBSCRIBED', id,
+      { investorAddress: dto.investorAddress, amount: String(dto.amount), tranche: dto.tranche ?? TrancheType.STANDARD,
+        jurisdiction: dto.jurisdiction ?? 'GLOBAL', attestation: dto.attestation?.payload ?? null, transactionHash });
+
     return { bondId: id, investorAddress: dto.investorAddress, amount: toBigIntString(dto.amount), transactionHash: transactionHash || '' };
+  }
+
+  private async verifySubscriptionEligibility(bondId: number, dto: SubscribeDto): Promise<void> {
+    const isRestrictedTranche = dto.tranche === TrancheType.RESTRICTED_ACCREDITED;
+
+    // 1. Sanctions check (if compliance rules engine and sanctions service are available)
+    if (this.complianceRulesEngine?.getSanctionsService()?.isSanctioned(dto.investorAddress)) {
+      throw new ForbiddenException(
+        `Investor address ${dto.investorAddress} is blocked under active sanctions screening`,
+      );
+    }
+
+    // 2. Restricted tranche requires signed attestation
+    if (isRestrictedTranche) {
+      if (!dto.attestation) {
+        throw new ForbiddenException(
+          'Restricted tranche requires a signed eligibility attestation issued after KYC completion',
+        );
+      }
+      if (this.complianceAttestation) {
+        const verification = this.complianceAttestation.verifyAttestation(dto.attestation, {
+          expectedInvestor: dto.investorAddress,
+          expectedBondId: bondId,
+          expectedTranche: dto.tranche,
+        });
+        if (!verification.valid) {
+          throw new ForbiddenException(
+            `Eligibility attestation verification failed: ${verification.reason}`,
+          );
+        }
+      }
+    } else if (dto.attestation && this.complianceAttestation) {
+      // Optional attestation verification on standard tranches
+      const verification = this.complianceAttestation.verifyAttestation(dto.attestation, {
+        expectedInvestor: dto.investorAddress,
+        expectedBondId: bondId,
+        expectedTranche: dto.tranche,
+      });
+      if (!verification.valid) {
+        throw new ForbiddenException(
+          `Eligibility attestation verification failed: ${verification.reason}`,
+        );
+      }
+    }
+
+    // 3. Jurisdiction rules evaluation if specified or in attestation
+    if (this.complianceRulesEngine && (dto.jurisdiction || dto.attestation)) {
+      const jurisdiction = dto.jurisdiction || dto.attestation?.payload?.jurisdiction || 'GLOBAL';
+      const decision = this.complianceRulesEngine.evaluateEligibility({
+        investorAddress: dto.investorAddress,
+        bondId,
+        tranche: dto.tranche || TrancheType.STANDARD,
+        jurisdiction,
+        purchaseAmount: dto.amount != null ? String(dto.amount) : undefined,
+        kycRecord: dto.attestation?.payload
+          ? {
+              status: dto.attestation.payload.kycStatus,
+            }
+          : undefined,
+      });
+
+      if (!decision.eligible) {
+        throw new ForbiddenException(
+          `Investor eligibility check failed: [${decision.code}] ${decision.reason}`,
+        );
+      }
+    }
   }
 
   async getHolders(id: number): Promise<HolderListResponse> {
@@ -234,7 +317,9 @@ export class BondsService {
       }
     }
 
-    const { result } = await this.contractService.invokeContractMethod(
+
+
+    const { result, transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
       [
         Address.fromString(adminAddress).toScVal(),
@@ -243,10 +328,13 @@ export class BondsService {
         xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
         nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     const parsed = scValToNative(result) as any[];
+    await this.complianceSnapshots?.capture(`bond:${id}:coupon:${dto.periodIndex}`, 'COUPON_DISTRIBUTED', id,
+      { periodIndex: dto.periodIndex, reportId: dto.reportId, holderAddresses,
+        totalCredits: toBigIntString(parsed?.[2] ?? 0), transactionHash });
     return {
       bondId: id,
       periodIndex: dto.periodIndex,
@@ -265,7 +353,7 @@ export class BondsService {
         Address.fromString(dto.investorAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
       ],
-      nonce,
+      dto.investorAddress,
     );
 
     this.invalidatePortfolio(dto.investorAddress);
@@ -290,7 +378,7 @@ export class BondsService {
         nativeToScVal(BigInt(id), { type: 'u64' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
-      nonce,
+      dto.fromAddress,
     );
 
     await this.holderIndex.recordTransfer(id, dto.fromAddress, dto.toAddress);
@@ -375,6 +463,7 @@ export class BondsService {
     return out;
   }
 
+
   /**
    * Itemized claimable-credit provenance for a single holder on a single bond
    * (issue #156). Surfaces every period/report/type line so the UI can group
@@ -399,13 +488,38 @@ export class BondsService {
       args: [nativeToScVal(BigInt(bondId), { type: 'u64' }), Address.fromString(address).toScVal()],
     });
 
-    const raw = scValToNative(scVal);
-    const details = Array.isArray(raw)
-      ? raw.map((entry) => decodeClaimableCreditDetail(entry))
-      : [];
+    const nativeResult = scValToNative(scVal) as any[];
+    if (!nativeResult || !nativeResult.length) {
+      return { bondId, address, total: '0', details: [] };
+    }
 
-    const total = details.reduce((sum, line) => sum + BigInt(line.amount), 0n);
-    return { bondId, address, total: total.toString(), details };
+    let total = 0n;
+    const details = [];
+
+    for (const item of nativeResult) {
+      const periodIndex = Number(item.period_index ?? item[0] ?? 0);
+      const reportId = Number(item.report_id ?? item[1] ?? 0);
+      const startTime = Number(item.start_time ?? item[2] ?? 0);
+      const endTime = Number(item.end_time ?? item[3] ?? 0);
+      const creditType = String(item.credit_type ?? item[4] ?? '');
+      const amount = BigInt(item.amount ?? item[5] ?? 0);
+      details.push({
+        periodIndex,
+        reportId,
+        startTime,
+        endTime,
+        creditType,
+        amount: amount.toString(),
+      });
+      total += amount;
+    }
+
+    return {
+      bondId,
+      address,
+      total: total.toString(),
+      details,
+    };
   }
 
   /**
@@ -469,7 +583,7 @@ export class BondsService {
         Address.fromString(adminAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     return {
@@ -484,19 +598,23 @@ export class BondsService {
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
     const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
 
+    let transactionHash: string | undefined;
     try {
-      await this.contractService.invokeContractMethod(
+      ({ transactionHash } = await this.contractService.invokeContractMethod(
         this.configService.getBondIssuerAddress(), 'mature_bond', adminSecret,
         [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
-        nonce,
-      );
+        adminAddress,
+      ));
     } catch (error) {
       throw this.mapBondError(error, id);
     }
 
     await this.redis.del(`bond:${id}`);
     await this.redis.delPattern('portfolio:*').catch(() => undefined);
-    return this.buildBondResponse(id);
+    const bond = await this.buildBondResponse(id);
+    await this.complianceSnapshots?.capture(`bond:${id}:matured`, 'BOND_MATURED', id,
+      { bond, transactionHash });
+    return bond;
   }
 
   private encodeBondConfig(dto: CreateBondDto): xdr.ScVal {
@@ -508,6 +626,26 @@ export class BondsService {
       nativeToScVal(BigInt(dto.maturityDate), { type: 'u64' }),
       nativeToScVal(BigInt(dto.totalSupply), { type: 'i128' }),
     ]);
+  }
+
+  async previewSubscribe(
+    id: number,
+    amount: number,
+  ): Promise<{ remaining_supply: number; requested_amount: number; expected_failure: string | null }> {
+    const rawResult = await this.contractService.simulateCall({
+      contractAddress: this.configService.getBondIssuerAddress(),
+      method: 'preview_subscribe',
+      args: [
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        nativeToScVal(BigInt(amount), { type: 'i128' }),
+      ],
+    });
+    const parsed = scValToNative(rawResult);
+    return {
+      remaining_supply: Number(parsed?.remaining_supply ?? 0),
+      requested_amount: Number(parsed?.requested_amount ?? amount),
+      expected_failure: parsed?.expected_failure != null ? String(parsed.expected_failure) : null,
+    };
   }
 
   private async buildBondResponse(id: number): Promise<BondResponse> {
